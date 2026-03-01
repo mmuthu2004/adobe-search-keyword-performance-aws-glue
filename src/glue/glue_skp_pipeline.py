@@ -1,18 +1,21 @@
 """
 Glue ETL job — replaces spark_skp_pipeline.py + EMR Serverless.
-Same 9-step pipeline; GlueContext wraps the SparkSession.
-Job bookmarks handle file-level deduplication automatically.
+Processes raw Adobe Analytics hit data (12-column tab-delimited format).
+ref_domain and search_keyword are derived from the referrer URL.
 """
 import sys
+import re
 import json
 import logging
+from urllib.parse import urlparse, parse_qs
+
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, StringType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +31,11 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)          # enables job bookmarks
 
 config = json.loads(args.get('config', '{}'))
-SEARCH_ENGINES = config.get('search_engines', ['google.com', 'bing.com', 'yahoo.com'])
+SEARCH_ENGINES = config.get('search_engines', [
+    'google.com', 'bing.com', 'yahoo.com', 'msn.com', 'ask.com', 'aol.com'
+])
+KEYWORD_PARAMS = config.get('keyword_params', ['q', 'p', 'query', 'text', 's', 'qs'])
+PURCHASE_EVENT = config.get('purchase_event', '1')
 REVENUE_THRESHOLD = config.get('revenue_threshold', 0.0)
 NULL_THRESHOLD = config.get('null_threshold', 0.5)
 
@@ -38,30 +45,55 @@ logger.info("Input: %s | Output: %s", input_path, output_path)
 
 # ── Step 1: Read ──────────────────────────────────────────────────────────────
 df = spark.read.option("sep", "\t").option("header", "true").csv(input_path)
+logger.info("Rows read: %d | Columns: %s", df.count(), df.columns)
 
-# ── Step 2: Schema validation ─────────────────────────────────────────────────
-REQUIRED = [
-    'hit_time_gmt', 'ref_domain', 'search_engine_natural_keyword',
-    'post_visid_high', 'post_visid_low', 'visit_num',
-    'visit_page_num', 'product_list', 'ip',
-]
+# ── Step 2: Schema validation — matches actual hit_data.tab columns ───────────
+REQUIRED = ['hit_time_gmt', 'ip', 'event_list', 'product_list', 'referrer']
 missing = [c for c in REQUIRED if c not in df.columns]
 if missing:
     raise ValueError(f"Missing columns: {missing}")
 
 # ── Step 3: Null validation ───────────────────────────────────────────────────
 total = df.count()
-for col in ['hit_time_gmt', 'ref_domain', 'ip']:
+for col in ['hit_time_gmt', 'ip', 'referrer']:
     null_rate = df.filter(F.col(col).isNull()).count() / total
     if null_rate > NULL_THRESHOLD:
         raise ValueError(f"Null rate too high for '{col}': {null_rate:.2%}")
 
-# ── Step 4: Row-level deduplication ──────────────────────────────────────────
-# File-level dedup is handled by Glue job bookmarks (--job-bookmark-option)
-KEY_COLS = ['hit_time_gmt', 'post_visid_high', 'post_visid_low', 'visit_num', 'visit_page_num']
-df = df.dropDuplicates(KEY_COLS)
+# ── Step 4: Deduplication ─────────────────────────────────────────────────────
+KEY_COLS = ['hit_time_gmt', 'ip', 'page_url']
+available_keys = [c for c in KEY_COLS if c in df.columns]
+df = df.dropDuplicates(available_keys)
 
-# ── Step 5: Session extraction — first-touch search referral per visitor ──────
+# ── Step 5: Derive ref_domain and search_keyword from referrer URL ────────────
+def extract_domain(url):
+    """Extract bare domain from referrer URL (strips www. prefix)."""
+    if not url:
+        return None
+    match = re.search(r'https?://(?:www\.)?([^/?\s]+)', url)
+    return match.group(1).lower() if match else None
+
+def extract_keyword(url):
+    """Extract search keyword from referrer URL query params."""
+    if not url:
+        return None
+    try:
+        params = parse_qs(urlparse(url).query)
+        for param in ['q', 'p', 'query', 'text', 's', 'qs']:
+            if param in params and params[param][0].strip():
+                return params[param][0].strip()
+    except Exception:
+        pass
+    return None
+
+extract_domain_udf = F.udf(extract_domain, StringType())
+extract_keyword_udf = F.udf(extract_keyword, StringType())
+
+df = (df
+      .withColumn('ref_domain', extract_domain_udf(F.col('referrer')))
+      .withColumn('search_keyword', extract_keyword_udf(F.col('referrer'))))
+
+# ── Step 6: Session extraction — first-touch search referral per visitor ──────
 search_df = df.filter(F.col('ref_domain').isin(SEARCH_ENGINES))
 window = Window.partitionBy('ip').orderBy('hit_time_gmt')
 search_df = (search_df
@@ -69,9 +101,9 @@ search_df = (search_df
              .filter(F.col('rn') == 1)
              .drop('rn'))
 
-# ── Step 6: Revenue parsing ───────────────────────────────────────────────────
+# ── Step 7: Revenue parsing from product_list ─────────────────────────────────
 def parse_revenue(product_list):
-    """Extract total revenue from Adobe Analytics product_list string."""
+    """Sum revenue from Adobe product_list: category;name;qty;price;...,... """
     if not product_list:
         return 0.0
     total = 0.0
@@ -84,27 +116,32 @@ def parse_revenue(product_list):
     return total
 
 parse_revenue_udf = F.udf(parse_revenue, DoubleType())
-revenue_df = (df.filter(F.col('product_list').isNotNull())
-                .withColumn('revenue', parse_revenue_udf(F.col('product_list'))))
 
-# ── Step 7: Attribution — join revenue to first-touch session ─────────────────
+# Only rows with purchase event (event_list contains "1")
+revenue_df = (df
+              .filter(F.col('product_list').isNotNull())
+              .filter(F.col('event_list').contains(PURCHASE_EVENT))
+              .withColumn('revenue', parse_revenue_udf(F.col('product_list'))))
+
+# ── Step 8: Attribution — join purchase revenue to first-touch search session ─
 attributed = (search_df.alias('s')
               .join(revenue_df.alias('r'), on='ip', how='inner')
               .select(
                   F.col('s.ref_domain').alias('search_engine'),
-                  F.col('s.search_engine_natural_keyword').alias('keyword'),
+                  F.col('s.search_keyword').alias('keyword'),
                   F.col('r.revenue'),
               )
               .filter(F.col('revenue') > REVENUE_THRESHOLD))
 
-# ── Step 8: Aggregation ───────────────────────────────────────────────────────
+# ── Step 9: Aggregate and write ───────────────────────────────────────────────
 result = (attributed
           .groupBy('search_engine', 'keyword')
           .agg(F.sum('revenue').alias('revenue'))
           .orderBy(F.desc('revenue')))
 
-# ── Step 9: Output (tab-delimited) ───────────────────────────────────────────
-logger.info("Writing results to %s", output_path)
+logger.info("Result rows: %d", result.count())
+logger.info("Writing to: %s", output_path)
+
 (result.write
        .mode('overwrite')
        .option('sep', '\t')

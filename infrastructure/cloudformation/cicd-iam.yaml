@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM user for GitHub Actions CI/CD — least-privilege access for
+  S3 uploads, Lambda deploys, and Glue job management.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AccountId:
+    Type: String
+
+Resources:
+
+  # ── IAM Policy ────────────────────────────────────────────────────────────
+  CICDPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub skp-cicd-policy-${Environment}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # S3: upload Lambda zip + Glue script; read test data; delete smoke-test file
+          - Sid: S3CICDAccess
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::skp-raw-${Environment}-${AccountId}
+              - !Sub arn:aws:s3:::skp-raw-${Environment}-${AccountId}/*
+              - !Sub arn:aws:s3:::skp-processed-${Environment}-${AccountId}
+              - !Sub arn:aws:s3:::skp-processed-${Environment}-${AccountId}/*
+
+          # Lambda: deploy skp-search-keyword-performance (existing)
+          - Sid: LambdaDeployMain
+            Effect: Allow
+            Action:
+              - lambda:UpdateFunctionCode
+              - lambda:GetFunctionConfiguration
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub arn:aws:lambda:us-east-1:${AccountId}:function:skp-search-keyword-performance
+
+          # Lambda: deploy skp-glue-trigger (new)
+          - Sid: LambdaDeployGlueTrigger
+            Effect: Allow
+            Action:
+              - lambda:UpdateFunctionCode
+              - lambda:GetFunctionConfiguration
+            Resource:
+              - !Sub arn:aws:lambda:us-east-1:${AccountId}:function:skp-glue-trigger-${Environment}
+
+          # Glue: verify job exists + start runs (smoke test / manual trigger)
+          - Sid: GlueJobAccess
+            Effect: Allow
+            Action:
+              - glue:GetJob
+              - glue:StartJobRun
+              - glue:GetJobRun
+            Resource:
+              - !Sub arn:aws:glue:us-east-1:${AccountId}:job/skp-keyword-performance-${Environment}
+
+  # ── IAM User ──────────────────────────────────────────────────────────────
+  CICDUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub skp-cicd-${Environment}
+      ManagedPolicyArns:
+        - !Ref CICDPolicy
+
+  # ── Access Key (stored in Secrets Manager — do NOT hardcode in outputs) ───
+  CICDAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref CICDUser
+
+  CICDSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub skp-cicd-credentials-${Environment}
+      Description: AWS access key for GitHub Actions CI/CD user
+      SecretString: !Sub |
+        {
+          "AWS_ACCESS_KEY_ID": "${CICDAccessKey}",
+          "AWS_SECRET_ACCESS_KEY": "${CICDAccessKey.SecretAccessKey}"
+        }
+
+Outputs:
+  CICDUserName:
+    Value: !Ref CICDUser
+    Description: IAM username for GitHub Actions
+
+  CredentialsSecretArn:
+    Value: !Ref CICDSecret
+    Description: >
+      Retrieve credentials from Secrets Manager — do not log or print.
+      Run: aws secretsmanager get-secret-value --secret-id skp-cicd-credentials-dev
+    Export:
+      Name: !Sub SKP-CICDSecret-${Environment}
