@@ -145,11 +145,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── Existing Lambda deploy (unchanged) ──────────────────────────────────
+      # ── Existing Lambda deploy ───────────────────────────────────────────────
       - name: Upload Lambda zip to S3
         run: |
           echo "Uploading Lambda package to S3..."
-          aws s3 cp skp_lambda.zip s3://${{ env.S3_RAW_BUCKET }}/lambda/skp_lambda.zip
+          aws s3api put-object \
+            --bucket ${{ env.S3_RAW_BUCKET }} \
+            --key lambda/skp_lambda.zip \
+            --body skp_lambda.zip \
+            --region ${{ env.AWS_REGION }}
           echo "Upload complete."
 
       - name: Deploy to Lambda
@@ -164,19 +168,25 @@ jobs:
             --function-name ${{ env.LAMBDA_FUNCTION_NAME }}
           echo "Lambda deployment complete."
 
-      # ── Glue deploy (new) ────────────────────────────────────────────────────
+      # ── Glue deploy ──────────────────────────────────────────────────────────
       - name: Upload Glue ETL script to S3
         run: |
           echo "Uploading Glue script..."
-          aws s3 cp src/glue/glue_skp_pipeline.py \
-            s3://${{ env.S3_RAW_BUCKET }}/glue/glue_skp_pipeline.py
+          aws s3api put-object \
+            --bucket ${{ env.S3_RAW_BUCKET }} \
+            --key glue/glue_skp_pipeline.py \
+            --body src/glue/glue_skp_pipeline.py \
+            --region ${{ env.AWS_REGION }}
           echo "Glue script uploaded — job picks up new script on next run."
 
       - name: Deploy Glue trigger Lambda
         run: |
           echo "Deploying Glue trigger Lambda..."
-          aws s3 cp trigger_lambda.zip \
-            s3://${{ env.S3_RAW_BUCKET }}/glue/trigger_lambda.zip
+          aws s3api put-object \
+            --bucket ${{ env.S3_RAW_BUCKET }} \
+            --key glue/trigger_lambda.zip \
+            --body trigger_lambda.zip \
+            --region ${{ env.AWS_REGION }}
           aws lambda update-function-code \
             --function-name ${{ env.GLUE_TRIGGER_FUNCTION_NAME }} \
             --s3-bucket ${{ env.S3_RAW_BUCKET }} \
@@ -203,14 +213,18 @@ jobs:
 
           aws s3 rm s3://${{ env.S3_RAW_BUCKET }}/archive/other/hit_data.tab --quiet || true
 
-          aws s3 cp tests/data/hit_data.tab s3://${{ env.S3_RAW_BUCKET }}/raw/hit_data.tab
+          aws s3api put-object \
+            --bucket ${{ env.S3_RAW_BUCKET }} \
+            --key raw/lambda/hit_data.tab \
+            --body tests/data/hit_data.tab \
+            --region ${{ env.AWS_REGION }}
 
           cat > payload.json << 'EOF'
           {
             "Records": [{
               "s3": {
                 "bucket": { "name": "skp-raw-dev-099622553872" },
-                "object": { "key": "raw/hit_data.tab" }
+                "object": { "key": "raw/lambda/hit_data.tab" }
               }
             }]
           }
