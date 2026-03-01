@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SKP Glue Pipeline Stack — replaces EMR Serverless.
+  Trigger Lambda (S3 event) → Glue ETL job (PySpark).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AccountId:
+    Type: String
+  GlueScriptBucket:
+    Type: String
+    Description: S3 bucket where CI/CD uploads glue_skp_pipeline.py
+
+# Naming mirrors skp-stack.yaml conventions (SKP-{Resource}-{Env})
+Resources:
+
+  # ── IAM: Glue service role ────────────────────────────────────────────────
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub skp-glue-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: SKPGlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:aws:s3:::skp-raw-${Environment}-${AccountId}
+                  - !Sub arn:aws:s3:::skp-raw-${Environment}-${AccountId}/*
+                  - !Sub arn:aws:s3:::skp-processed-${Environment}-${AccountId}
+                  - !Sub arn:aws:s3:::skp-processed-${Environment}-${AccountId}/*
+                  - !Sub arn:aws:s3:::${GlueScriptBucket}
+                  - !Sub arn:aws:s3:::${GlueScriptBucket}/*
+
+  # ── Glue ETL job ─────────────────────────────────────────────────────────
+  SKPGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub skp-keyword-performance-${Environment}
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptBucket}/glue/glue_skp_pipeline.py
+        PythonVersion: '3'
+      NumberOfWorkers: 2        # G.1X = 4 vCPU / 16 GB each; cheapest option
+      WorkerType: G.1X
+      Timeout: 60               # minutes
+      ExecutionProperty:
+        MaxConcurrentRuns: 5
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-enable   # file-level dedup
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--output_path': !Sub s3://skp-processed-${Environment}-${AccountId}/processed/
+        '--env': !Ref Environment
+        '--config': '{}'
+
+  # ── IAM: trigger Lambda role ──────────────────────────────────────────────
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub skp-glue-trigger-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartGlueJob
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: glue:StartJobRun
+                Resource: !Sub arn:aws:glue:us-east-1:${AccountId}:job/skp-keyword-performance-${Environment}
+
+  # ── Trigger Lambda (thin shim — no business logic) ────────────────────────
+  TriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub skp-glue-trigger-${Environment}
+      Runtime: python3.12
+      Handler: trigger_lambda.handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref SKPGlueJob
+          PROCESSED_BUCKET: !Sub skp-processed-${Environment}-${AccountId}
+          APP_ENV: !Ref Environment
+      Code:
+        S3Bucket: !Ref GlueScriptBucket
+        S3Key: glue/trigger_lambda.zip
+
+  TriggerLambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::skp-raw-${Environment}-${AccountId}
+
+Outputs:
+  GlueJobName:
+    Value: !Ref SKPGlueJob
+    Export:
+      Name: !Sub SKP-GlueJob-${Environment}
+  TriggerLambdaArn:
+    Value: !GetAtt TriggerLambda.Arn
+    Export:
+      Name: !Sub SKP-GlueTrigger-${Environment}
