@@ -86,6 +86,7 @@ def extract_keyword(url):
         pass
     return None
 
+
 extract_domain_udf = F.udf(extract_domain, StringType())
 extract_keyword_udf = F.udf(extract_keyword, StringType())
 
@@ -114,6 +115,7 @@ def parse_revenue(product_list):
         except (ValueError, IndexError):
             pass
     return total
+
 
 parse_revenue_udf = F.udf(parse_revenue, DoubleType())
 
